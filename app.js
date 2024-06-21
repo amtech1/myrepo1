@@ -7,100 +7,150 @@ const bodyParser = require("body-parser");
 
 const app = express();
 const port = 3000;
+const scriptDir = __dirname; // Directory where the script is located
+const upload = multer({ dest: "uploads/" }); // Upload directory for the new data files
 
 app.use(bodyParser.urlencoded({ extended: true }));
 
-const upload = multer({ dest: "uploads/" });
-
 // Serve HTML form
 app.get("/", (req, res) => {
-  const formHtml = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Upload Excel File</title>
-    </head>
-    <body>
-      <h1>Upload Excel File and Specify Sheet Name</h1>
-      <form action="/upload" method="post" enctype="multipart/form-data">
-        <label for="file">Select Excel File:</label><br>
-        <input type="file" id="file" name="file" accept=".xlsx"><br><br>
-        <label for="sheetName">Sheet Name:</label><br>
-        <input type="text" id="sheetName" name="sheetName"><br><br>
-        <button type="submit">Upload and Process</button>
-      </form>
-    </body>
-    </html>
-  `;
-  res.send(formHtml);
+  fs.readdir(scriptDir, (err, files) => {
+    if (err) {
+      return res.status(500).send("Unable to scan files.");
+    }
+
+    const xlsxFiles = files.filter((file) => path.extname(file) === ".xlsx");
+
+    let fileOptions = xlsxFiles
+      .map((file) => `<option value="${file}">${file}</option>`)
+      .join("");
+
+    const formHtml = `
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Select Template File</title>
+      </head>
+      <body>
+        <h1>Select Template File and Upload Data File</h1>
+        <form action="/process" method="post" enctype="multipart/form-data">
+          <label for="templateFileName">Choose Template File:</label><br>
+          <select id="templateFileName" name="templateFileName">
+            ${fileOptions}
+          </select><br><br>
+          <label for="dataFile">Upload Data File:</label><br>
+          <input type="file" id="dataFile" name="dataFile" accept=".xlsx"><br><br>
+          <button type="submit">Upload and Process</button>
+        </form>
+      </body>
+      </html>
+    `;
+    res.send(formHtml);
+  });
 });
 
-// Handle file upload and processing
-app.post("/upload", upload.single("file"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).send("No file uploaded.");
+// Handle file selection and processing
+app.post("/process", upload.single("dataFile"), async (req, res) => {
+  const templateFileName = req.body.templateFileName;
+  const dataFilePath = req.file ? req.file.path : null;
+
+  if (!templateFileName || !dataFilePath) {
+    return res.status(400).send("Template file or data file not provided.");
   }
 
-  const sheetName = req.body.sheetName;
-  const filePath = req.file.path;
+  const templateFilePath = path.join(scriptDir, templateFileName);
+  const sheetName = "Output";
 
   try {
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.readFile(filePath);
+    // Load the template workbook
+    const templateWorkbook = new ExcelJS.Workbook();
+    await templateWorkbook.xlsx.readFile(templateFilePath);
 
-    // Delete all sheets except the specified sheetName
-    workbook.eachSheet((sheet, sheetId) => {
+    // Load the data workbook
+    const dataWorkbook = new ExcelJS.Workbook();
+    await dataWorkbook.xlsx.readFile(dataFilePath);
+
+    // Get the first sheet from the data workbook
+    const dataSheet = dataWorkbook.worksheets[0];
+
+    // Get the input sheet from the template workbook
+    const inputSheet = templateWorkbook.getWorksheet("Input");
+    if (!inputSheet) {
+      throw new Error("Input sheet not found in the template file.");
+    }
+
+    // Clear existing data in the input sheet (optional)
+    inputSheet.eachRow((row) => {
+      row.eachCell((cell) => {
+        cell.value = null;
+      });
+    });
+
+    // Copy data from the data sheet to the input sheet
+    dataSheet.eachRow((row, rowNumber) => {
+      row.eachCell((cell, colNumber) => {
+        inputSheet.getCell(rowNumber, colNumber).value = cell.value;
+      });
+    });
+
+    // Ensure all cell values in the output sheet are static
+    const outputSheet = templateWorkbook.getWorksheet(sheetName);
+    if (!outputSheet) {
+      throw new Error("Output sheet not found in the template file.");
+    }
+
+    outputSheet.eachRow((row) => {
+      row.eachCell({ includeEmpty: true }, (cell) => {
+        if (cell.type === ExcelJS.ValueType.Formula) {
+          cell.value = cell.result || 0; // Use result if available, else default to 0
+          cell.type = ExcelJS.ValueType.Number; // Change type to number (or string if necessary)
+        }
+        // Handle localization or non-English characters if needed
+        if (typeof cell.value === "string" && /[^\x00-\x7F]/.test(cell.value)) {
+          cell.value = convertToBaseValue(cell.value); // Implement your conversion logic
+        }
+      });
+    });
+
+    // Remove all sheets except the output sheet
+    templateWorkbook.eachSheet((sheet, sheetId) => {
       if (sheet.name !== sheetName) {
-        workbook.removeWorksheet(sheetId);
-      } else {
-        // Ensure all cell values are static
-        sheet.eachRow((row) => {
-          row.eachCell({ includeEmpty: true }, (cell) => {
-            if (cell.type === ExcelJS.ValueType.Formula) {
-              // Convert formulas to static values
-              cell.value = cell.result || 0; // Use result if available, else default to 0
-              cell.type = ExcelJS.ValueType.Number; // Change type to number (or string if necessary)
-            }
-            // Handle localization or non-English characters if needed
-            // Example: Convert non-ASCII characters to base values
-            if (
-              typeof cell.value === "string" &&
-              /[^\x00-\x7F]/.test(cell.value)
-            ) {
-              cell.value = convertToBaseValue(cell.value); // Implement your conversion logic
-            }
-          });
-        });
+        templateWorkbook.removeWorksheet(sheetId);
       }
     });
 
-    const tempOutputFilePath = path.join("uploads", `${sheetName}.xlsx`);
+    const tempOutputFilePath = path.join(
+      scriptDir,
+      `processed_${templateFileName}`
+    );
 
-    // Example: Ensure gridlines are set
-    const sheet = workbook.getWorksheet(sheetName);
-    sheet.views = [
-      {
-        showGridLines: false, // Ensure gridlines are visible in the output
-      },
-    ];
+    // Preserve the original gridline settings
+    if (outputSheet) {
+      outputSheet.views = outputSheet.views.map((view) => ({
+        ...view,
+        showGridLines: view.showGridLines,
+      }));
+    }
 
-    await workbook.xlsx.writeFile(tempOutputFilePath);
-    fs.unlinkSync(filePath);
+    await templateWorkbook.xlsx.writeFile(tempOutputFilePath);
 
-    res.download(tempOutputFilePath, `${sheetName}.xlsx`, (err) => {
+    res.download(tempOutputFilePath, `processed_${templateFileName}`, (err) => {
       if (err) {
         console.error(err);
         res.status(500).send("An error occurred during file download.");
       } else {
         fs.unlinkSync(tempOutputFilePath); // Clean up the temporary file
+        fs.unlinkSync(dataFilePath); // Clean up the uploaded data file
       }
     });
   } catch (error) {
-    fs.unlinkSync(filePath);
     console.error(error);
     res.status(500).send("An error occurred during file processing.");
+    if (dataFilePath) {
+      fs.unlinkSync(dataFilePath); // Clean up the uploaded data file
+    }
   }
 });
 
